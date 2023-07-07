@@ -796,3 +796,47 @@ describe('atomWithObservable vanilla tests', () => {
     unsub()
   })
 })
+
+it('stays mounted with async dependencies (issue 2030)', async () => {
+  //FIXME: using Subject instead of BehaviorSubject fixes the issue
+  const subject = new BehaviorSubject<number>(0)
+  const observableAtom = atomWithObservable(() => subject)
+  let mountCount = 0
+
+  observableAtom.onMount = () => {
+    mountCount++
+  }
+
+  const unusedDepAtom = atom(async () => 0)
+
+  const countAtom = atom(async (get) => {
+    //FIXME: not awaiting this fixes the issue
+    //i.e. this works (or just not using at all)
+    //const _unusedDep = get(unusedDepAtom);
+    const _unusedDep = await get(unusedDepAtom)
+    return await get(observableAtom)
+  })
+
+  const CounterValue = () => {
+    const state = useAtomValue(countAtom)
+    return <>count: {state}</>
+  }
+
+  const { findByText } = render(
+    <StrictMode>
+      <Suspense fallback="loading">
+        <CounterValue />
+      </Suspense>
+    </StrictMode>
+  )
+
+  await findByText('loading')
+
+  for (let i = 1; i <= 10; i++) {
+    act(() => subject.next(i))
+    await findByText(`count: ${i}`)
+  }
+
+  // allow a little room for react itself remounting
+  expect(mountCount).toBeLessThanOrEqual(5)
+})
