@@ -36,7 +36,11 @@ type ObservableLike<T> = {
     }
 )
 
-type SubjectLike<T> = ObservableLike<T> & Observer<T>
+type SubjectLike<T> = ObservableLike<T> &
+  Observer<T> & {
+    // only available in BehaviorSubject
+    getValue?: () => T
+  }
 
 type Options<Data> = {
   initialValue?: Data | (() => Data)
@@ -73,121 +77,119 @@ export function atomWithObservable<Data>(
   options?: Options<Data>
 ) {
   type Result = { d: Data } | { e: AnyError }
-  const returnResultData = (result: Result) => {
-    if ('e' in result) {
-      throw result.e
+
+  let timer: Timeout | undefined
+  let subscription: Subscription | undefined
+
+  const clearSubscription = () => {
+    if (timer) {
+      clearTimeout(timer)
+      timer = undefined
     }
-    return result.d
+    if (subscription) {
+      subscription.unsubscribe()
+      subscription = undefined
+    }
   }
 
-  const observableResultAtom = atom((get) => {
+  /*
+    Atom composition:
+    1. observableAtom: For the initial unresolved promise
+       - also sets the next atom on subsequent values
+    2. directAtom: For the latest result after that initial promise
+        or writing to the atom directly from the outside world
+    3. resultAtom: composes these into the true final result
+    4. finalAtom: returns the result and manages subscription lifecycle
+  */
+
+  let setDirectResult: ((result: Result) => void) | undefined
+  const directAtom = atom<Result | undefined>(undefined)
+  directAtom.onMount = (update) => {
+    setDirectResult = update
+  }
+
+  const observableAtom = atom<Promise<Result>>((get) => {
     let observable = getObservable(get)
+
     const itself = observable[Symbol.observable]?.()
     if (itself) {
       observable = itself
     }
 
-    let resolve: ((result: Result) => void) | undefined
-    const makePending = () =>
-      new Promise<Result>((r) => {
-        resolve = r
-      })
-    const initialResult: Result | Promise<Result> =
-      options && 'initialValue' in options
-        ? {
-            d:
-              typeof options.initialValue === 'function'
-                ? (options.initialValue as () => Data)()
-                : (options.initialValue as Data),
-          }
-        : makePending()
+    let resolveResult: ((result: Result) => void) | undefined
+    const promise = new Promise<Result>((resolve) => {
+      resolveResult = (data) => {
+        resolve(data)
+        // makes it easier to reason about that we either
+        // resolve the promise or set the data, never both
+        resolveResult = undefined
+      }
+    })
 
-    let setResult: ((result: Result) => void) | undefined
-    let lastResult: Result | undefined
     const listener = (result: Result) => {
-      lastResult = result
-      resolve?.(result)
-      setResult?.(result)
+      if (resolveResult) {
+        resolveResult(result)
+      } else if (setDirectResult) {
+        setDirectResult(result)
+      }
     }
 
-    let subscription: Subscription | undefined
-    let timer: Timeout | undefined
-    const isNotMounted = () => !setResult
-    const start = () => {
-      if (subscription) {
-        clearTimeout(timer)
-        subscription.unsubscribe()
-      }
-      subscription = observable.subscribe({
-        next: (d) => listener({ d }),
-        error: (e) => listener({ e }),
-        complete: () => {},
+    console.log('start called', Date.now())
+
+    clearSubscription()
+    subscription = observable.subscribe({
+      next: (d) => listener({ d }),
+      error: (e) => listener({ e }),
+      complete: () => {},
+    })
+
+    if (options && 'initialValue' in options) {
+      listener({
+        d:
+          typeof options.initialValue === 'function'
+            ? (options.initialValue as () => Data)()
+            : (options.initialValue as Data),
       })
-      if (isNotMounted() && options?.unstable_timeout) {
-        timer = setTimeout(() => {
-          if (subscription) {
-            subscription.unsubscribe()
-            subscription = undefined
-          }
-        }, options.unstable_timeout)
-      }
-    }
-    start()
-
-    const resultAtom = atom(lastResult || initialResult)
-
-    if (import.meta.env?.MODE !== 'production') {
-      resultAtom.debugPrivate = true
     }
 
-    resultAtom.onMount = (update) => {
-      setResult = update
-      if (lastResult) {
-        update(lastResult)
-      }
-      if (subscription) {
-        clearTimeout(timer)
-      } else {
-        start()
-      }
-      return () => {
-        setResult = undefined
-        if (subscription) {
-          subscription.unsubscribe()
-          subscription = undefined
-        }
-      }
+    if (options?.unstable_timeout) {
+      timer = setTimeout(() => {
+        clearSubscription()
+      }, options.unstable_timeout)
     }
-    return [resultAtom, observable, makePending, start, isNotMounted] as const
+
+    return promise
   })
 
-  if (import.meta.env?.MODE !== 'production') {
-    observableResultAtom.debugPrivate = true
-  }
+  const finalAtom = atom(
+    async (get) => {
+      const directResult = get(directAtom)
+      const promiseResult = await get(observableAtom)
+      const result = directResult ?? promiseResult
 
-  const observableAtom = atom(
-    (get) => {
-      const [resultAtom] = get(observableResultAtom)
-      const result = get(resultAtom)
-      if (result instanceof Promise) {
-        return result.then(returnResultData)
+      console.log(result)
+      if ('e' in result) {
+        throw result.e
       }
-      return returnResultData(result)
+      return result.d
     },
-    (get, set, data: Data) => {
-      const [resultAtom, observable, makePending, start, isNotMounted] =
-        get(observableResultAtom)
-      if ('next' in observable) {
-        if (isNotMounted()) {
-          set(resultAtom, makePending())
-          start()
-        }
-        observable.next(data)
-      } else {
-        throw new Error('observable is not subject')
+    (_get, _set, value: Data) => {
+      if (setDirectResult) {
+        setDirectResult({ d: value })
       }
     }
   )
 
-  return observableAtom
+  finalAtom.onMount = () => {
+    return () => {
+      console.log('final atom unmounted')
+      clearSubscription()
+    }
+  }
+
+  if (import.meta.env?.MODE !== 'production') {
+    finalAtom.debugPrivate = true
+  }
+
+  return finalAtom
 }
